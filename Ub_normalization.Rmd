@@ -1,0 +1,273 @@
+---
+title: "Protein abundance correction and harmonization - LSCC Ub data"
+author: "Pierre M Jean Beltran"
+date: "5/29/2020"
+output: html_document
+---
+
+#Setup
+```{r setup, include=FALSE}
+library(tidyverse)
+library(cmapR)
+library(ComplexHeatmap)
+library(imputeLCMD)
+library(circlize)
+library(viridis)
+library(cowplot); theme_set(theme_cowplot())
+library(RColorBrewer)
+library(devtools)
+library(limma)
+library(cluster)
+library(BayesFactor)
+library(lme4)
+source_url("https://raw.githubusercontent.com/pierremj/helper-functions/master/helper.functions.v1.1.R")
+```
+
+
+
+
+
+
+
+# 1. Ubiquitylome Tumor Only
+
+
+
+
+
+## 1.1 Original data
+```{r}
+#Read ubiquitylome data
+ub.original <- parse_gctx("./Input/lscc-v3.2-ubiquitylome-ratio-norm-NArm.gct")
+ub.original <- subset_gct(ub.original,cid = ub.original@cdesc$Type == "Tumor")
+ub.original.melt <- ub.original %>% melt_gct()
+
+#Write ubiquitylome dataset after
+write_gct(ub.original,"./Input/lscc-v3.2-ubiquitylome-ratio-norm-NArm-Tumoronly.gct",appenddim=F)
+```
+
+
+
+
+
+
+## 1.2. Proteome column filtered to match Ub
+```{r}
+#Read proteome data
+prot <- parse_gctx("./Input/lscc-v3.2-proteome-ratio-norm-NArm.gct")
+prot <- subset_gct(prot,cid = ub.original@cid)
+prot.melt <- prot %>% melt_gct
+
+write_gct(prot,"./Input/lscc-v3.2-proteome-ratio-norm-NArm-TumorOnly.gct",appenddim=F)
+```
+
+
+
+
+
+
+## 1.3. Ubiquitin sites that have protein data
+```{r}
+#Obtain a subset of data that overlaps with proteome
+ub.overlap <- subset_gct(ub.original, rid= ub.original@rdesc$accession_number %in% prot@rdesc$accession_number)
+ub.overlap.melt <- ub.overlap %>% melt_gct
+
+write_gct(ub.overlap,"./Input/lscc-v3.2-ubiquitylome-ratio-norm-NArm-TumorOnly-overlapProtein.gct",appenddim=F)
+```
+
+## 1.4. Ubiquitin data protein corrected using global slope
+```{r}
+#Get the correction factor for protein-level normalization
+ub.joint <- left_join(ub.overlap.melt,prot.melt,by = c("id.y" = "id.y","accession_number"="accession_number"),suffix=c(".ub",".prot"))
+
+correction.factor <- lm(value.ub~ value.prot,data=ub.joint)$coefficients[2]
+
+#Normalize the data using protein-level information
+ub.norm <- ub.overlap
+ub.norm@mat <- ub.norm@mat  -  correction.factor * prot@mat[ub.norm@rdesc$accession_number,]
+ub.norm.melt <- melt_gct(ub.norm)
+write_gct(ub.norm,"./Input/lscc-v3.2-ubiquitylome-ratio-norm-NArm-TumorOnly-ProteinCorrectedGlobal.gct",appenddim=F)
+```
+
+
+
+
+
+
+## 1.5. Ubiquitin data protein corrected using individual ub-site slopes
+
+These blocks correct by applying linear models at the protein level. The first one corrects using only the slope, the second one uses both slope and intercept.
+```{r}
+#Normalize the data using linear models at the sample and protein level
+ub.joint.nest <- ub.joint %>% group_by(accession_number,id.x.ub) %>% nest
+ub.joint.nest.lm <- ub.joint.nest %>% mutate(
+  coef = map_dbl(data,function(x){lm(value.ub~ value.prot,data=x)$coefficients[2]}),
+  df = map_dbl(data,function(x){lm(value.ub~ value.prot,data=x)$df.residual}),
+  intercept = map_dbl(data,function(x){lm(value.ub~ value.prot,data=x)$coefficients[1]}),
+  ) 
+
+#Plot some graphs about the linear model correction
+
+hist(ub.joint.nest.lm$coef)
+
+curr.prot <- (ub.joint.nest.lm %>% arrange(coef))$data [[6]]
+ggplot(curr.prot,aes(x=value.prot,y=value.ub))+
+  geom_point()+ 
+  geom_smooth(method='lm', formula= y~x)+
+  labs(x= "log2(Protein)", y= "log2(Ub site)")
+
+
+
+normalization.matrix <- prot@mat[ub.joint.nest.lm$accession_number,]*ub.joint.nest.lm$coef
+rownames(normalization.matrix) <- ub.joint.nest.lm$id.x.ub
+
+
+ub.norm.p <- ub.overlap
+ub.norm.p@mat <- ub.norm.p@mat - normalization.matrix[ub.norm.p@rid,]
+ub.norm.p.melt <- melt_gct(ub.norm.p)
+```
+
+Correct by applying linear model at the protein level and using both slope and intercept.
+```{r}
+ub.norm.p.intercept <- ub.overlap
+intercepts <- ub.joint.nest.lm$intercept
+names(intercepts) <- ub.joint.nest.lm$id.x.ub
+ub.norm.p.intercept@mat <- 
+  ub.norm.p.intercept@mat - 
+  intercepts[ub.norm.p.intercept@rid] - 
+  normalization.matrix[ub.norm.p.intercept@rid,]
+ub.norm.p.intercept.melt <- melt_gct(ub.norm.p.intercept)
+
+write_gct(ub.norm.p.intercept,"./Input/lscc-v3.2-ubiquitylome-ratio-norm-NArm-TumorOnly-ProteinCorrectedIndividual.gct",appenddim=F)
+```
+
+
+
+
+
+## 1.6. Ubiquitin data protein corrected using individual ub-site slopes and a multilayer model
+
+```{r}
+#Normalize the data using linear models at the sample and protein level
+dat <- ub.joint %>% select(id.x.prot,id.x.ub,value.ub,value.prot,id.y)
+M1 <- lmer(formula = value.ub ~ 1 + value.prot + (1 + value.prot | id.x.ub),
+           data = dat,
+           control = lmerControl(optimizer = 'Nelder_Mead'),
+           REML= T)
+coef.M1 <- coef(M1)$id.x.ub
+
+ub.norm.multi <- ub.overlap
+intercepts <- coef.M1[ub.norm.multi@rid,1]
+normalization.matrix <- prot@mat[ub.norm.multi@rdesc$accession_number,]*coef.M1[ub.norm.multi@rid,2]
+ub.norm.multi@mat <- 
+  ub.norm.multi@mat - 
+  intercepts - 
+  normalization.matrix
+ub.norm.multi.melt <- melt_gct(ub.norm.multi)
+
+write_gct(ub.norm.multi,"./Input/lscc-v3.2-ubiquitylome-ratio-norm-NArm-TumorOnly-ProteinCorrectedIndividualMultilevel.gct",appenddim=F)
+```
+
+
+
+
+
+
+## 1.7. Compare the different correction methods
+
+Plot some proteins that have various slopes and the results of the normalization at either the global level or at the protein level. This block does not use the multilevel model, but we could add it.
+```{r}
+plot_PTM_vs_prot <- function(PTM.melt,prot.melt,id,subtitle=""){
+  PTM.melt <- PTM.melt %>% filter(id.x == id)
+  dat <- left_join(PTM.melt,prot.melt,by=c("id.y" = "id.y","accession_number"="accession_number"),suffix = c(".ptm",".prot"))
+  ggplot(dat,aes(x=value.prot,y=value.ptm))+
+  geom_point()+ 
+  geom_smooth(method='lm', formula= y~x)+
+  labs(x= "log2(Protein)", y= "log2(PTM site)",title=id,subtitle=subtitle)+
+    coord_cartesian(ylim=c(-4,4),xlim=c(-4,4))
+}
+
+
+#Plot individual proteins with various slopes ---------------------------------------
+#Protein with coef -1.38 and intercept 0.92
+my.id <- "NP_060700.2_K825k _1_1_825_825"
+plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id,subtitle = "Original")
+plot_PTM_vs_prot(ub.norm.melt,prot.melt,my.id,subtitle = "Correction using global slope")
+plot_PTM_vs_prot(ub.norm.p.intercept.melt,prot.melt,my.id,subtitle = "Correction using Ub-site slope")
+
+
+#Protein with coef -1.67 and intercept -1
+my.id <- "NP_056993.2_K620k _1_1_620_620"
+plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id,subtitle = "Original")
+plot_PTM_vs_prot(ub.norm.melt,prot.melt,my.id,subtitle = "Correction using global slope")
+plot_PTM_vs_prot(ub.norm.p.intercept.melt,prot.melt,my.id,subtitle = "Correction using Ub-site slope")
+
+
+#Protein with slope of 0.314 and intercept of -0.657
+my.id = "NP_000030.1_K262k _1_1_262_262"
+plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id,subtitle = "Original")
+plot_PTM_vs_prot(ub.norm.melt,prot.melt,my.id,subtitle = "Correction using global slope")
+plot_PTM_vs_prot(ub.norm.p.intercept.melt,prot.melt,my.id,subtitle = "Correction using Ub-site slope")
+
+#Protein with -2.8 slope
+my.id <- "NP_037423.2_K847k _1_1_847_847"
+plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id,subtitle = "Original")
+plot_PTM_vs_prot(ub.norm.melt,prot.melt,my.id,subtitle = "Correction using global slope")
+plot_PTM_vs_prot(ub.norm.p.intercept.melt,prot.melt,my.id,subtitle = "Correction using Ub-site slope")
+
+#Protein with 2.93 slope
+my.id <- "NP_002796.4_K360k _1_1_360_360"
+plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id,subtitle = "Original")
+plot_PTM_vs_prot(ub.norm.melt,prot.melt,my.id,subtitle = "Correction using global slope")
+plot_PTM_vs_prot(ub.norm.p.intercept.melt,prot.melt,my.id,subtitle = "Correction using Ub-site slope")
+
+```
+
+
+Here, I am comparing the multilevel model, the global, and the protein-specific model. Then, I plot the fitted lines in the same graph for a few proteins.
+```{r}
+library(mlmRev)
+library(lme4)
+
+dat <- ub.joint %>% select(id.x.prot,id.x.ub,value.ub,value.prot,id.y)
+M1 <- lmer(formula = value.ub ~ 1 + value.prot + (1 + value.prot | id.x.ub),
+           data = dat,
+           control = lmerControl(optimizer = 'Nelder_Mead'),
+           REML= T)
+coef.M1 <- coef(M1)$id.x.ub
+
+M2 <- lm(value.ub ~ value.prot,data=dat)
+global.slope <- M2$coefficients[2]
+global.intercept <- M2$coefficients[1]
+
+my.id <- "NP_060700.2_K825k _1_1_825_825"
+g <- plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id)
+g <- g + geom_abline(intercept = global.intercept, slope = global.slope,color=3,size=1)+
+  geom_abline(intercept = coef.M1[my.id,1], slope = coef.M1[my.id,1],color=2,size=1)
+g
+
+my.id <- "NP_056993.2_K620k _1_1_620_620"
+g <- plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id)
+g <- g + geom_abline(intercept = global.intercept, slope = global.slope,color=3,size=1)+
+  geom_abline(intercept = coef.M1[my.id,1], slope = coef.M1[my.id,1],color=2,size=1)
+g
+
+my.id <- "NP_000030.1_K262k _1_1_262_262"
+g <- plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id)
+g <- g + geom_abline(intercept = global.intercept, slope = global.slope,color=3,size=1)+
+  geom_abline(intercept = coef.M1[my.id,1], slope = coef.M1[my.id,1],color=2,size=1)
+g
+
+my.id <- "NP_002796.4_K360k _1_1_360_360"
+g <- plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id)
+g <- g + geom_abline(intercept = global.intercept, slope = global.slope,color=3,size=1)+
+  geom_abline(intercept = coef.M1[my.id,1], slope = coef.M1[my.id,1],color=2,size=1)
+g
+
+my.id <- ub.original@rid[305]
+g <- plot_PTM_vs_prot(ub.original.melt,prot.melt,my.id)
+g <- g + geom_abline(intercept = global.intercept, slope = global.slope,color=3,size=1)+
+  geom_abline(intercept = coef.M1[my.id,1], slope = coef.M1[my.id,1],color=2,size=1)
+g
+
+```

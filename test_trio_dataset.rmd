@@ -1,0 +1,46 @@
+---
+title: "Test issue with dashed accessions"
+author: "Pierre Jean"
+date: "1/20/2021"
+output: html_document
+---
+
+#Setup
+```{r setup, include=FALSE}
+library(tidyverse)
+library(cmapR)
+library(cowplot); theme_set(theme_cowplot())
+library(RColorBrewer)
+library(devtools)
+library(limma)
+if(exists("~/helper-functions/helper.functions.v1.1.R")){
+  source("~/helper-functions/helper.functions.v1.1.R")
+} else{
+  source_url("https://raw.githubusercontent.com/pierremj/helper-functions/master/helper.functions.v1.1.R")
+}
+```
+
+
+#Read input data
+```{r}
+prot <- parse_gctx("./Input/Trio_Proteome.gct")
+ph <- parse_gctx("./Input/Trio_IMAC.gct")
+```
+
+#Create and read normalized data
+```{r}
+source("normalizePTM_globalOLS_v2.R")
+ph.norm <-PTM.normalization.lm(working.directory = "~/ptm-normalization-script-test/Input/",proteome.gct = "Trio_Proteome.gct",PTM.gct = "Trio_IMAC.gct",
+                     try.all.accession.numbers = T,save = F)
+setwd("~/ptm-normalization-script-test/")
+```
+
+
+#Check Q0KL02
+```{r}
+grep("Q0KL02",prot@rdesc$accession_numbers,value = T)
+grep("Q0KL02",prot@rid,value = T)
+grep("Q0KL02",ph@rdesc$accession_numbers,value = T)
+grep("Q0KL02",ph.norm@rdesc$accession_numbers,value = T)
+
+```
