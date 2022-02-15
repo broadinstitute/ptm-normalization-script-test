@@ -19,12 +19,12 @@
 
 PTM.normalization.lm <- function(
   
-  working.directory = "./Input/",
-  proteome.gct = 'lscc-v3.2-proteome-ratio-norm-NArm.gct',
-  PTM.gct = 'lscc-v3.2-acetylome-ratio-norm-NArm.gct',
+  working.directory = "~/Projects/ptm-normalization-script-test/Input/",
+  proteome.gct = 'klhl30_proteome_reporterintensity.gct',
+  PTM.gct = 'klhl30_ubiquitylome_reporterintensity.gct',
   
-  try.all.accession.numbers = TRUE,    #will try all PTM accession numbers to find a protein match
-  save = FALSE          #save file?
+  try.all.accession.numbers = T,    #will try all PTM accession numbers to find a protein match
+  save = TRUE        #save file?
   
 )
 
